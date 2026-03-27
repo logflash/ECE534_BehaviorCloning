@@ -5,6 +5,22 @@ The model predicts discretized velocity commands (x, y, θ) from front-camera im
 
 ---
 
+## Environment
+
+We collected the data by adapting LeKiwi scripts for interacting with the robot (see our [data collection](about:blank) repository). No simulation was used. Below is a picture of our physical environment setup during training and inference:
+
+![LeKiwi robot](assets/robot_photo.jpg)
+
+---
+
+## Demo
+
+See below for a demo of our robot properly avoiding a blue obstacle in pursuit of the green goal block:
+
+[![Watch the video](assets/demo_thumbnail.png)](https://youtu.be/mEzUk4MJih4)
+
+---
+
 ## Setup
 
 Create a Python 3.10 virtual environment named `rob534` and install all dependencies (including PyTorch with CUDA 12.4):
