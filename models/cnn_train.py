@@ -21,10 +21,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.cnn_policy import CNNPolicy
 
 
+# Maps (x_old_class, theta_old_class) → joint 5-class index.
+# x_old_class: 0=-0.3, 1=0.0, 2=+0.3  (only 1 and 2 are valid here)
+# theta_old_class: 0=-90, 1=0, 2=+90
+_LABEL_MAP = {
+    (1, 0): 0,  # x= 0.0, θ= -90
+    (1, 2): 1,  # x= 0.0, θ= +90
+    (2, 0): 2,  # x=+0.3, θ= -90
+    (2, 1): 3,  # x=+0.3, θ=   0
+    (2, 2): 4,  # x=+0.3, θ= +90
+}
+_CLASS_LABELS = ["x=0 θ=-90", "x=0 θ=+90", "x=.3 θ=-90", "x=.3 θ=0", "x=.3 θ=+90"]
+
+
+def build_5class_labels(raw_labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert raw 3-column labels to 5-class joint labels, filtering invalid rows.
+
+    Valid rows: x_class ∈ {1, 2} (non-negative x) and not (x=0, theta=0).
+    Returns (mask, y) where mask selects valid rows and y is shape (M,) int64.
+    """
+    x_cls = raw_labels[:, 0]
+    theta_cls = raw_labels[:, 2]
+    mask = np.array([(xc, tc) in _LABEL_MAP for xc, tc in zip(x_cls, theta_cls)])
+    y = np.array([_LABEL_MAP[(xc, tc)]
+                  for xc, tc in zip(x_cls[mask], theta_cls[mask])], dtype=np.int64)
+    return mask, y
+
+
 def plot_history(history: dict, output_path: str) -> None:
     _, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    # Loss curve
     axes[0].plot(history["train_loss"], label="train")
     axes[0].plot(history["val_loss"],   label="val")
     axes[0].set_xlabel("Epoch")
@@ -33,14 +60,10 @@ def plot_history(history: dict, output_path: str) -> None:
     axes[0].legend()
     axes[0].grid(True)
 
-    # Accuracy curves
-    axes[1].plot(history["val_acc_x"],     label="x.vel")
-    axes[1].plot(history["val_acc_theta"], label="θ.vel")
-    axes[1].plot(history["val_acc_mean"],  label="mean", linestyle="--", color="black")
+    axes[1].plot(history["val_acc"], color="steelblue")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy")
-    axes[1].set_title("Validation Accuracy per Action Component")
-    axes[1].legend()
+    axes[1].set_title("Validation Accuracy (joint 5-class)")
     axes[1].grid(True)
 
     plt.tight_layout()
@@ -68,8 +91,6 @@ def main():
                         help="Directory for saved model and plots (default: ./models/checkpoints)")
     parser.add_argument("--device",     default=None,
                         help="'cuda' or 'cpu' (default: auto-detect)")
-    parser.add_argument("--nostop",     action="store_true",
-                        help="Discard examples where x.vel==0 AND theta.vel==0 during training")
     parser.add_argument("--icw",        action="store_true",
                         help="Use inverted class weights to counteract class imbalance")
     args = parser.parse_args()
@@ -82,16 +103,20 @@ def main():
 
     print(f"Loading dataset from {args.data} ...")
     data = np.load(args.data)
-    X = data["images"]              # (N, 84, 84, 3), uint8
-    y = data["labels"][:, [0, 2]]  # (N, 2), int64 — x.vel and theta.vel only
+    X_all = data["images"]   # (N, 84, 84, 3), uint8
+    raw_labels = data["labels"]  # (N, 3), int64
 
+    # ── Build 5-class labels, filtering invalid examples ─────────────────────
+    mask, y = build_5class_labels(raw_labels)
+    X = X_all[mask]
+    n_dropped = len(X_all) - len(X)
+    print(f"  {len(X)} valid examples ({n_dropped} dropped: negative x or x=0,θ=0)")
     print(f"  images: {X.shape}  {X.dtype}")
-    print(f"  labels: {y.shape}  {y.dtype}  (x.vel, theta.vel)")
+    print(f"  labels: {y.shape}  {y.dtype}  (5-class joint)")
 
-    # ── Train / test split (stratified by joint x.vel + theta.vel label) ─────
-    strat_key = y[:, 0] * 3 + y[:, 1]  # unique int per (x_class, theta_class)
+    # ── Train / test split (stratified by joint class) ────────────────────────
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=42, stratify=strat_key
+        X, y, test_size=args.test_size, random_state=42, stratify=y
     )
     print(f"\nSplit: {len(X_train)} train / {len(X_test)} test")
 
@@ -104,7 +129,6 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         val_split=args.val_split,
-        filter_stop=args.nostop,
         use_icw=args.icw,
         verbose=True,
     )
@@ -112,20 +136,16 @@ def main():
     # ── Evaluate on held-out test set ─────────────────────────────────────────
     print("\n── Test set evaluation ──")
     metrics = policy.evaluate(X_test, y_test)
-    print(f"  loss      : {metrics['loss']:.4f}")
-    print(f"  acc x.vel : {metrics['acc_x']:.4f}")
-    print(f"  acc θ.vel : {metrics['acc_theta']:.4f}")
-    print(f"  acc mean  : {metrics['acc_mean']:.4f}")
+    print(f"  loss : {metrics['loss']:.4f}")
+    print(f"  acc  : {metrics['acc']:.4f}")
 
-    # ── Prediction distribution (verify model isn't collapsed to all-stop) ────
+    # ── Prediction distribution (verify model isn't collapsed) ────────────────
     preds = policy.predict(X_test)
     print("\n── Predicted class distribution on test set ──")
-    for col, (name, values) in enumerate([("x.vel", [-0.3, 0.0, 0.3]), ("θ.vel", [-90, 0, 90])]):
-        counts = np.bincount(preds[:, col], minlength=3)
-        total = counts.sum()
-        row = "  ".join(f"{v:>5}: {counts[i]:4d} ({100*counts[i]/total:4.1f}%)"
-                        for i, v in enumerate(values))
-        print(f"  {name}  {row}")
+    counts = np.bincount(preds, minlength=5)
+    total = counts.sum()
+    for i, label in enumerate(_CLASS_LABELS):
+        print(f"  class {i} ({label}): {counts[i]:4d} ({100*counts[i]/total:4.1f}%)")
 
     # ── Save model ────────────────────────────────────────────────────────────
     model_path = os.path.join(args.output_dir, "cnn_policy.pth")

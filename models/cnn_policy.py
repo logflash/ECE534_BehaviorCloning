@@ -4,9 +4,12 @@ cnn_policy.py
 CNN-based behavior cloning policy for predicting discretized velocity commands
 from robot camera images.
 
-The model outputs 6 logits representing 2 independent softmax distributions:
-  - logits[0:3]: x.vel  ∈ {-0.3, 0.0, +0.3}  → class indices {0, 1, 2}
-  - logits[3:6]: θ.vel  ∈ { -90,   0,  +90}  → class indices {0, 1, 2}
+The model outputs 5 logits over a single joint softmax for (x.vel, θ.vel):
+  0: x= 0.0, θ= -90
+  1: x= 0.0, θ= +90
+  2: x=+0.3, θ= -90
+  3: x=+0.3, θ=   0
+  4: x=+0.3, θ= +90
 """
 
 import numpy as np
@@ -34,7 +37,7 @@ class _ConvBlock(nn.Sequential):
 
 class _CNNNet(nn.Module):
     """
-    Small CNN for 84×84 RGB input → 6 logits.
+    Small CNN for 84×84 RGB input → 5 logits (joint action class).
 
     Architecture:
         Block 1: Conv(3→32)  + BN + ReLU + MaxPool  → (B, 32, 42, 42)
@@ -43,7 +46,7 @@ class _CNNNet(nn.Module):
         Block 4: Conv(128→256)+ BN + ReLU           → (B,256, 10, 10)
         GlobalAvgPool                               → (B, 256)
         Dropout(0.3)
-        Linear(256 → 6)
+        Linear(256 → 5)
     """
 
     def __init__(self):
@@ -57,7 +60,7 @@ class _CNNNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(256, 6),
+            nn.Linear(256, 5),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,8 +93,7 @@ class CNNPolicy:
 
         self.model = _CNNNet().to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self._ce_x = nn.CrossEntropyLoss()
-        self._ce_t = nn.CrossEntropyLoss()
+        self._ce = nn.CrossEntropyLoss()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -103,19 +105,12 @@ class CNNPolicy:
         return t.permute(0, 3, 1, 2)              # (N, 3, H, W)
 
     def _loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Sum of cross-entropy losses for the 2 action components (x, theta)."""
-        return (
-            self._ce_x(logits[:, 0:3], y[:, 0])
-            + self._ce_t(logits[:, 3:6], y[:, 1])
-        )
+        """Cross-entropy loss over 5 joint action classes."""
+        return self._ce(logits, y)
 
-    def _accuracy(self, logits: torch.Tensor, y: torch.Tensor) -> tuple[float, float]:
-        """Per-component accuracy: (acc_x, acc_theta)."""
-        pred_x = logits[:, 0:3].argmax(dim=1)
-        pred_t = logits[:, 3:6].argmax(dim=1)
-        acc_x = (pred_x == y[:, 0]).float().mean().item()
-        acc_t = (pred_t == y[:, 1]).float().mean().item()
-        return acc_x, acc_t
+    def _accuracy(self, logits: torch.Tensor, y: torch.Tensor) -> float:
+        """Joint action class accuracy."""
+        return (logits.argmax(dim=1) == y).float().mean().item()
 
     # ------------------------------------------------------------------
     # Public API
@@ -128,7 +123,6 @@ class CNNPolicy:
         epochs: int = 20,
         batch_size: int = 64,
         val_split: float = 0.1,
-        filter_stop: bool = False,
         use_icw: bool = False,
         verbose: bool = True,
     ) -> dict:
@@ -139,54 +133,39 @@ class CNNPolicy:
         ----------
         X : np.ndarray, shape (N, H, W, 3), dtype uint8
             Image observations.
-        y : np.ndarray, shape (N, 2), dtype int64
-            Class labels for [x.vel, theta.vel].
+        y : np.ndarray, shape (N,), dtype int64
+            Joint action class indices (0–4).
         epochs : int
             Number of training epochs.
         batch_size : int
             Mini-batch size.
         val_split : float
             Fraction of data held out for validation (shuffled).
-        filter_stop : bool
-            If True, discard all examples where x.vel == 0 AND theta.vel == 0
-            (i.e. the robot stays completely still) from both train and val.
         use_icw : bool
             If True, weight each class by the inverse of its frequency in the
-            training split, independently for x.vel and theta.vel.
+            training split.
         verbose : bool
             Print epoch summaries.
 
         Returns
         -------
-        dict with keys 'train_loss', 'val_loss', 'val_acc_x',
-        'val_acc_theta', 'val_acc_mean' — each a list of per-epoch values.
+        dict with keys 'train_loss', 'val_loss', 'val_acc' — each a list of
+        per-epoch values.
         """
-        # ── optional: drop fully-stopped examples ────────────────────────────
-        if filter_stop:
-            moving = ~((y[:, 0] == 1) & (y[:, 1] == 1))
-            n_dropped = int((~moving).sum())
-            X, y = X[moving], y[moving]
-            if verbose:
-                print(f"filter_stop: dropped {n_dropped} stop examples, {len(X)} remaining")
-
-        strat_key = y[:, 0] * 3 + y[:, 1]
         X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=val_split, stratify=strat_key
+            X, y, test_size=val_split, stratify=y
         )
 
         # ── optional: inverted class weights from training split ──────────────
         if use_icw:
-            for col, attr in enumerate(["_ce_x", "_ce_t"]):
-                counts = np.bincount(y_train[:, col], minlength=3).astype(np.float32)
-                weights = 1.0 / np.maximum(counts, 1)
-                weights = torch.from_numpy(weights / weights.sum()).to(self.device)
-                setattr(self, attr, nn.CrossEntropyLoss(weight=weights))
-                if verbose:
-                    name = ["x.vel", "θ.vel"][col]
-                    print(f"icw {name}: {weights.cpu().numpy().round(4)}")
+            counts = np.bincount(y_train, minlength=5).astype(np.float32)
+            weights = 1.0 / np.maximum(counts, 1)
+            weights = torch.from_numpy(weights / weights.sum()).to(self.device)
+            self._ce = nn.CrossEntropyLoss(weight=weights)
+            if verbose:
+                print(f"icw weights: {weights.cpu().numpy().round(4)}")
         else:
-            self._ce_x = nn.CrossEntropyLoss()
-            self._ce_t = nn.CrossEntropyLoss()
+            self._ce = nn.CrossEntropyLoss()
 
         X_train_t = self._preprocess(X_train)
         y_train_t = torch.from_numpy(y_train).long()
@@ -199,8 +178,7 @@ class CNNPolicy:
         )
 
         history: dict[str, list] = {
-            "train_loss": [], "val_loss": [],
-            "val_acc_x": [], "val_acc_theta": [], "val_acc_mean": [],
+            "train_loss": [], "val_loss": [], "val_acc": [],
         }
 
         best_val_loss = float("inf")
@@ -226,8 +204,7 @@ class CNNPolicy:
             with torch.no_grad():
                 val_logits = self._infer_batched(X_val_t, batch_size=256)
                 val_loss = self._loss(val_logits, y_val_t.to(self.device)).item()
-                acc_x, acc_t = self._accuracy(val_logits, y_val_t.to(self.device))
-                acc_mean = (acc_x + acc_t) / 2
+                acc = self._accuracy(val_logits, y_val_t.to(self.device))
 
             # ── checkpoint best weights ──
             if val_loss < best_val_loss:
@@ -239,17 +216,14 @@ class CNNPolicy:
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
-            history["val_acc_x"].append(acc_x)
-            history["val_acc_theta"].append(acc_t)
-            history["val_acc_mean"].append(acc_mean)
+            history["val_acc"].append(acc)
 
             if verbose:
                 print(
                     f"Epoch {epoch:3d}/{epochs}  "
                     f"train_loss={train_loss:.4f}  "
                     f"val_loss={val_loss:.4f}  "
-                    f"val_acc=[x:{acc_x:.3f} θ:{acc_t:.3f}]  "
-                    f"mean={acc_mean:.3f}{marker}"
+                    f"val_acc={acc:.3f}{marker}"
                 )
 
         # ── restore best weights ──
@@ -263,16 +237,16 @@ class CNNPolicy:
 
     def evaluate(self, X: np.ndarray, y: np.ndarray) -> dict:
         """
-        Compute loss and per-component accuracy on a held-out set.
+        Compute loss and accuracy on a held-out set.
 
         Parameters
         ----------
         X : np.ndarray, shape (N, H, W, 3), dtype uint8
-        y : np.ndarray, shape (N, 2), dtype int64
+        y : np.ndarray, shape (N,), dtype int64  — joint action class indices
 
         Returns
         -------
-        dict with keys: 'loss', 'acc_x', 'acc_theta', 'acc_mean'
+        dict with keys: 'loss', 'acc'
         """
         X_t = self._preprocess(X)
         y_t = torch.from_numpy(y).long()
@@ -281,36 +255,32 @@ class CNNPolicy:
         with torch.no_grad():
             logits = self._infer_batched(X_t, batch_size=256)
             loss = self._loss(logits, y_t.to(self.device)).item()
-            acc_x, acc_t = self._accuracy(logits, y_t.to(self.device))
+            acc = self._accuracy(logits, y_t.to(self.device))
 
-        return {
-            "loss": loss,
-            "acc_x": acc_x,
-            "acc_theta": acc_t,
-            "acc_mean": (acc_x + acc_t) / 2,
-        }
+        return {"loss": loss, "acc": acc}
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        Predict class indices for each action component.
+        Predict joint action class indices.
 
         Returns
         -------
-        np.ndarray of shape (N, 2), dtype int64  — columns: [x.vel, theta.vel]
+        np.ndarray of shape (N,), dtype int64  — values in {0,1,2,3,4}
         """
         X_t = self._preprocess(X)
         self.model.eval()
         with torch.no_grad():
-            logits = self._infer_batched(X_t, batch_size=256)  # (N, 6)
-        preds = torch.stack([
-            logits[:, 0:3].argmax(dim=1),
-            logits[:, 3:6].argmax(dim=1),
-        ], dim=1)
-        return preds.cpu().numpy().astype(np.int64)
+            logits = self._infer_batched(X_t, batch_size=256)  # (N, 5)
+        return logits.argmax(dim=1).cpu().numpy().astype(np.int64)
 
-    # Maps class index → real control value for each component
-    _X_VALUES     = {0: -0.3, 1: 0.0, 2: 0.3}
-    _THETA_VALUES = {0: -90.0, 1: 0.0, 2: 90.0}
+    # Joint class index → (x_vel, theta_vel) real values
+    _CLASS_TO_CONTROLS = {
+        0: (0.0,  -90.0),
+        1: (0.0,  +90.0),
+        2: (0.3,  -90.0),
+        3: (0.3,    0.0),
+        4: (0.3,  +90.0),
+    }
 
     def get_controls(self, image: np.ndarray) -> dict[str, float]:
         """
@@ -322,15 +292,13 @@ class CNNPolicy:
 
         Returns
         -------
-        dict with keys 'x_vel', 'theta_vel' mapped to their real control
-        values: x ∈ {-0.3, 0.0, 0.3}, theta ∈ {-90, 0, 90}.
+        dict with keys 'x_vel', 'theta_vel':
+          x    ∈ {0.0, 0.3}, theta ∈ {-90, 0, 90}
+          (x=0, theta=0) is never predicted.
         """
-        X = image[np.newaxis]  # (1, H, W, 3)
-        classes = self.predict(X)[0]  # (2,)
-        return {
-            "x_vel":     self._X_VALUES[int(classes[0])],
-            "theta_vel": self._THETA_VALUES[int(classes[1])],
-        }
+        cls = int(self.predict(image[np.newaxis])[0])
+        x_vel, theta_vel = self._CLASS_TO_CONTROLS[cls]
+        return {"x_vel": x_vel, "theta_vel": theta_vel}
 
     def _infer_batched(self, X_t: torch.Tensor, batch_size: int = 256) -> torch.Tensor:
         """Run inference in batches to avoid OOM on large inputs."""
