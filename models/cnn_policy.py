@@ -12,6 +12,7 @@ The model outputs 6 logits representing 2 independent softmax distributions:
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -89,7 +90,8 @@ class CNNPolicy:
 
         self.model = _CNNNet().to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self._ce = nn.CrossEntropyLoss()
+        self._ce_x = nn.CrossEntropyLoss()
+        self._ce_t = nn.CrossEntropyLoss()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -103,8 +105,8 @@ class CNNPolicy:
     def _loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Sum of cross-entropy losses for the 2 action components (x, theta)."""
         return (
-            self._ce(logits[:, 0:3], y[:, 0])
-            + self._ce(logits[:, 3:6], y[:, 1])
+            self._ce_x(logits[:, 0:3], y[:, 0])
+            + self._ce_t(logits[:, 3:6], y[:, 1])
         )
 
     def _accuracy(self, logits: torch.Tensor, y: torch.Tensor) -> tuple[float, float]:
@@ -127,6 +129,7 @@ class CNNPolicy:
         batch_size: int = 64,
         val_split: float = 0.1,
         filter_stop: bool = False,
+        use_icw: bool = False,
         verbose: bool = True,
     ) -> dict:
         """
@@ -147,6 +150,9 @@ class CNNPolicy:
         filter_stop : bool
             If True, discard all examples where x.vel == 0 AND theta.vel == 0
             (i.e. the robot stays completely still) from both train and val.
+        use_icw : bool
+            If True, weight each class by the inverse of its frequency in the
+            training split, independently for x.vel and theta.vel.
         verbose : bool
             Print epoch summaries.
 
@@ -163,13 +169,24 @@ class CNNPolicy:
             if verbose:
                 print(f"filter_stop: dropped {n_dropped} stop examples, {len(X)} remaining")
 
-        N = len(X)
-        n_val = max(1, int(N * val_split))
-        perm = np.random.permutation(N)
-        val_idx, train_idx = perm[:n_val], perm[n_val:]
+        strat_key = y[:, 0] * 3 + y[:, 1]
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=val_split, stratify=strat_key
+        )
 
-        X_train, y_train = X[train_idx], y[train_idx]
-        X_val,   y_val   = X[val_idx],   y[val_idx]
+        # ── optional: inverted class weights from training split ──────────────
+        if use_icw:
+            for col, attr in enumerate(["_ce_x", "_ce_t"]):
+                counts = np.bincount(y_train[:, col], minlength=3).astype(np.float32)
+                weights = 1.0 / np.maximum(counts, 1)
+                weights = torch.from_numpy(weights / weights.sum()).to(self.device)
+                setattr(self, attr, nn.CrossEntropyLoss(weight=weights))
+                if verbose:
+                    name = ["x.vel", "θ.vel"][col]
+                    print(f"icw {name}: {weights.cpu().numpy().round(4)}")
+        else:
+            self._ce_x = nn.CrossEntropyLoss()
+            self._ce_t = nn.CrossEntropyLoss()
 
         X_train_t = self._preprocess(X_train)
         y_train_t = torch.from_numpy(y_train).long()

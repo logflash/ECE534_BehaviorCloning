@@ -22,7 +22,7 @@ from models.cnn_policy import CNNPolicy
 
 
 def plot_history(history: dict, output_path: str) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    _, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     # Loss curve
     axes[0].plot(history["train_loss"], label="train")
@@ -70,6 +70,8 @@ def main():
                         help="'cuda' or 'cpu' (default: auto-detect)")
     parser.add_argument("--nostop",     action="store_true",
                         help="Discard examples where x.vel==0 AND theta.vel==0 during training")
+    parser.add_argument("--icw",        action="store_true",
+                        help="Use inverted class weights to counteract class imbalance")
     args = parser.parse_args()
 
     # ── Load dataset ──────────────────────────────────────────────────────────
@@ -86,9 +88,10 @@ def main():
     print(f"  images: {X.shape}  {X.dtype}")
     print(f"  labels: {y.shape}  {y.dtype}  (x.vel, theta.vel)")
 
-    # ── Train / test split ────────────────────────────────────────────────────
+    # ── Train / test split (stratified by joint x.vel + theta.vel label) ─────
+    strat_key = y[:, 0] * 3 + y[:, 1]  # unique int per (x_class, theta_class)
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=42, shuffle=True
+        X, y, test_size=args.test_size, random_state=42, stratify=strat_key
     )
     print(f"\nSplit: {len(X_train)} train / {len(X_test)} test")
 
@@ -102,6 +105,7 @@ def main():
         batch_size=args.batch_size,
         val_split=args.val_split,
         filter_stop=args.nostop,
+        use_icw=args.icw,
         verbose=True,
     )
 
@@ -112,6 +116,16 @@ def main():
     print(f"  acc x.vel : {metrics['acc_x']:.4f}")
     print(f"  acc θ.vel : {metrics['acc_theta']:.4f}")
     print(f"  acc mean  : {metrics['acc_mean']:.4f}")
+
+    # ── Prediction distribution (verify model isn't collapsed to all-stop) ────
+    preds = policy.predict(X_test)
+    print("\n── Predicted class distribution on test set ──")
+    for col, (name, values) in enumerate([("x.vel", [-0.3, 0.0, 0.3]), ("θ.vel", [-90, 0, 90])]):
+        counts = np.bincount(preds[:, col], minlength=3)
+        total = counts.sum()
+        row = "  ".join(f"{v:>5}: {counts[i]:4d} ({100*counts[i]/total:4.1f}%)"
+                        for i, v in enumerate(values))
+        print(f"  {name}  {row}")
 
     # ── Save model ────────────────────────────────────────────────────────────
     model_path = os.path.join(args.output_dir, "cnn_policy.pth")
