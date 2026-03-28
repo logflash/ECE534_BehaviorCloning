@@ -4,10 +4,9 @@ cnn_policy.py
 CNN-based behavior cloning policy for predicting discretized velocity commands
 from robot camera images.
 
-The model outputs 9 logits representing 3 independent softmax distributions:
+The model outputs 6 logits representing 2 independent softmax distributions:
   - logits[0:3]: x.vel  ∈ {-0.3, 0.0, +0.3}  → class indices {0, 1, 2}
-  - logits[3:6]: y.vel  ∈ {-0.3, 0.0, +0.3}  → class indices {0, 1, 2}
-  - logits[6:9]: θ.vel  ∈ { -90,   0,  +90}  → class indices {0, 1, 2}
+  - logits[3:6]: θ.vel  ∈ { -90,   0,  +90}  → class indices {0, 1, 2}
 """
 
 import numpy as np
@@ -34,7 +33,7 @@ class _ConvBlock(nn.Sequential):
 
 class _CNNNet(nn.Module):
     """
-    Small CNN for 84×84 RGB input → 9 logits.
+    Small CNN for 84×84 RGB input → 6 logits.
 
     Architecture:
         Block 1: Conv(3→32)  + BN + ReLU + MaxPool  → (B, 32, 42, 42)
@@ -43,7 +42,7 @@ class _CNNNet(nn.Module):
         Block 4: Conv(128→256)+ BN + ReLU           → (B,256, 10, 10)
         GlobalAvgPool                               → (B, 256)
         Dropout(0.3)
-        Linear(256 → 9)
+        Linear(256 → 6)
     """
 
     def __init__(self):
@@ -57,7 +56,7 @@ class _CNNNet(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(256, 9),
+            nn.Linear(256, 6),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,22 +101,19 @@ class CNNPolicy:
         return t.permute(0, 3, 1, 2)              # (N, 3, H, W)
 
     def _loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Sum of cross-entropy losses for the 3 action components."""
+        """Sum of cross-entropy losses for the 2 action components (x, theta)."""
         return (
             self._ce(logits[:, 0:3], y[:, 0])
             + self._ce(logits[:, 3:6], y[:, 1])
-            + self._ce(logits[:, 6:9], y[:, 2])
         )
 
-    def _accuracy(self, logits: torch.Tensor, y: torch.Tensor) -> tuple[float, float, float]:
-        """Per-component accuracy: (acc_x, acc_y, acc_theta)."""
+    def _accuracy(self, logits: torch.Tensor, y: torch.Tensor) -> tuple[float, float]:
+        """Per-component accuracy: (acc_x, acc_theta)."""
         pred_x = logits[:, 0:3].argmax(dim=1)
-        pred_y = logits[:, 3:6].argmax(dim=1)
-        pred_t = logits[:, 6:9].argmax(dim=1)
+        pred_t = logits[:, 3:6].argmax(dim=1)
         acc_x = (pred_x == y[:, 0]).float().mean().item()
-        acc_y = (pred_y == y[:, 1]).float().mean().item()
-        acc_t = (pred_t == y[:, 2]).float().mean().item()
-        return acc_x, acc_y, acc_t
+        acc_t = (pred_t == y[:, 1]).float().mean().item()
+        return acc_x, acc_t
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,6 +126,7 @@ class CNNPolicy:
         epochs: int = 20,
         batch_size: int = 64,
         val_split: float = 0.1,
+        filter_stop: bool = False,
         verbose: bool = True,
     ) -> dict:
         """
@@ -139,22 +136,33 @@ class CNNPolicy:
         ----------
         X : np.ndarray, shape (N, H, W, 3), dtype uint8
             Image observations.
-        y : np.ndarray, shape (N, 3), dtype int64
-            Class labels for [x.vel, y.vel, theta.vel].
+        y : np.ndarray, shape (N, 2), dtype int64
+            Class labels for [x.vel, theta.vel].
         epochs : int
             Number of training epochs.
         batch_size : int
             Mini-batch size.
         val_split : float
             Fraction of data held out for validation (shuffled).
+        filter_stop : bool
+            If True, discard all examples where x.vel == 0 AND theta.vel == 0
+            (i.e. the robot stays completely still) from both train and val.
         verbose : bool
             Print epoch summaries.
 
         Returns
         -------
-        dict with keys 'train_loss', 'val_loss', 'val_acc_x', 'val_acc_y',
+        dict with keys 'train_loss', 'val_loss', 'val_acc_x',
         'val_acc_theta', 'val_acc_mean' — each a list of per-epoch values.
         """
+        # ── optional: drop fully-stopped examples ────────────────────────────
+        if filter_stop:
+            moving = ~((y[:, 0] == 1) & (y[:, 1] == 1))
+            n_dropped = int((~moving).sum())
+            X, y = X[moving], y[moving]
+            if verbose:
+                print(f"filter_stop: dropped {n_dropped} stop examples, {len(X)} remaining")
+
         N = len(X)
         n_val = max(1, int(N * val_split))
         perm = np.random.permutation(N)
@@ -175,7 +183,7 @@ class CNNPolicy:
 
         history: dict[str, list] = {
             "train_loss": [], "val_loss": [],
-            "val_acc_x": [], "val_acc_y": [], "val_acc_theta": [], "val_acc_mean": [],
+            "val_acc_x": [], "val_acc_theta": [], "val_acc_mean": [],
         }
 
         best_val_loss = float("inf")
@@ -201,8 +209,8 @@ class CNNPolicy:
             with torch.no_grad():
                 val_logits = self._infer_batched(X_val_t, batch_size=256)
                 val_loss = self._loss(val_logits, y_val_t.to(self.device)).item()
-                acc_x, acc_y, acc_t = self._accuracy(val_logits, y_val_t.to(self.device))
-                acc_mean = (acc_x + acc_y + acc_t) / 3
+                acc_x, acc_t = self._accuracy(val_logits, y_val_t.to(self.device))
+                acc_mean = (acc_x + acc_t) / 2
 
             # ── checkpoint best weights ──
             if val_loss < best_val_loss:
@@ -215,7 +223,6 @@ class CNNPolicy:
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
             history["val_acc_x"].append(acc_x)
-            history["val_acc_y"].append(acc_y)
             history["val_acc_theta"].append(acc_t)
             history["val_acc_mean"].append(acc_mean)
 
@@ -224,7 +231,7 @@ class CNNPolicy:
                     f"Epoch {epoch:3d}/{epochs}  "
                     f"train_loss={train_loss:.4f}  "
                     f"val_loss={val_loss:.4f}  "
-                    f"val_acc=[x:{acc_x:.3f} y:{acc_y:.3f} θ:{acc_t:.3f}]  "
+                    f"val_acc=[x:{acc_x:.3f} θ:{acc_t:.3f}]  "
                     f"mean={acc_mean:.3f}{marker}"
                 )
 
@@ -244,11 +251,11 @@ class CNNPolicy:
         Parameters
         ----------
         X : np.ndarray, shape (N, H, W, 3), dtype uint8
-        y : np.ndarray, shape (N, 3), dtype int64
+        y : np.ndarray, shape (N, 2), dtype int64
 
         Returns
         -------
-        dict with keys: 'loss', 'acc_x', 'acc_y', 'acc_theta', 'acc_mean'
+        dict with keys: 'loss', 'acc_x', 'acc_theta', 'acc_mean'
         """
         X_t = self._preprocess(X)
         y_t = torch.from_numpy(y).long()
@@ -257,14 +264,13 @@ class CNNPolicy:
         with torch.no_grad():
             logits = self._infer_batched(X_t, batch_size=256)
             loss = self._loss(logits, y_t.to(self.device)).item()
-            acc_x, acc_y, acc_t = self._accuracy(logits, y_t.to(self.device))
+            acc_x, acc_t = self._accuracy(logits, y_t.to(self.device))
 
         return {
             "loss": loss,
             "acc_x": acc_x,
-            "acc_y": acc_y,
             "acc_theta": acc_t,
-            "acc_mean": (acc_x + acc_y + acc_t) / 3,
+            "acc_mean": (acc_x + acc_t) / 2,
         }
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -273,21 +279,20 @@ class CNNPolicy:
 
         Returns
         -------
-        np.ndarray of shape (N, 3), dtype int64
+        np.ndarray of shape (N, 2), dtype int64  — columns: [x.vel, theta.vel]
         """
         X_t = self._preprocess(X)
         self.model.eval()
         with torch.no_grad():
-            logits = self._infer_batched(X_t, batch_size=256)  # (N, 9)
+            logits = self._infer_batched(X_t, batch_size=256)  # (N, 6)
         preds = torch.stack([
             logits[:, 0:3].argmax(dim=1),
             logits[:, 3:6].argmax(dim=1),
-            logits[:, 6:9].argmax(dim=1),
         ], dim=1)
         return preds.cpu().numpy().astype(np.int64)
 
     # Maps class index → real control value for each component
-    _XY_VALUES    = {0: -0.3, 1: 0.0, 2: 0.3}
+    _X_VALUES     = {0: -0.3, 1: 0.0, 2: 0.3}
     _THETA_VALUES = {0: -90.0, 1: 0.0, 2: 90.0}
 
     def get_controls(self, image: np.ndarray) -> dict[str, float]:
@@ -300,15 +305,14 @@ class CNNPolicy:
 
         Returns
         -------
-        dict with keys 'x_vel', 'y_vel', 'theta_vel' mapped to their
-        real control values: x/y ∈ {-0.3, 0.0, 0.3}, theta ∈ {-90, 0, 90}.
+        dict with keys 'x_vel', 'theta_vel' mapped to their real control
+        values: x ∈ {-0.3, 0.0, 0.3}, theta ∈ {-90, 0, 90}.
         """
         X = image[np.newaxis]  # (1, H, W, 3)
-        classes = self.predict(X)[0]  # (3,)
+        classes = self.predict(X)[0]  # (2,)
         return {
-            "x_vel":     self._XY_VALUES[int(classes[0])],
-            "y_vel":     self._XY_VALUES[int(classes[1])],
-            "theta_vel": self._THETA_VALUES[int(classes[2])],
+            "x_vel":     self._X_VALUES[int(classes[0])],
+            "theta_vel": self._THETA_VALUES[int(classes[1])],
         }
 
     def _infer_batched(self, X_t: torch.Tensor, batch_size: int = 256) -> torch.Tensor:

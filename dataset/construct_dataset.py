@@ -1,7 +1,7 @@
 """
 construct_dataset.py
 
-Downloads the TagAggDann/lekiwi_green_block dataset from HuggingFace,
+Downloads the TagAggDann/lekiwi_green_block_session2 dataset from HuggingFace,
 decodes video frames, discretizes actions, and saves a .npz dataset.
 
 Usage:
@@ -19,7 +19,7 @@ import pandas as pd
 from huggingface_hub import snapshot_download
 
 
-REPO_ID = "TagAggDann/lekiwi_green_block"
+REPO_ID = "TagAggDann/lekiwi_green_block_session2"
 IMAGE_SIZE = 84  # resize frames to IMAGE_SIZE x IMAGE_SIZE
 
 

@@ -35,7 +35,6 @@ def plot_history(history: dict, output_path: str) -> None:
 
     # Accuracy curves
     axes[1].plot(history["val_acc_x"],     label="x.vel")
-    axes[1].plot(history["val_acc_y"],     label="y.vel")
     axes[1].plot(history["val_acc_theta"], label="θ.vel")
     axes[1].plot(history["val_acc_mean"],  label="mean", linestyle="--", color="black")
     axes[1].set_xlabel("Epoch")
@@ -69,6 +68,8 @@ def main():
                         help="Directory for saved model and plots (default: ./models/checkpoints)")
     parser.add_argument("--device",     default=None,
                         help="'cuda' or 'cpu' (default: auto-detect)")
+    parser.add_argument("--nostop",     action="store_true",
+                        help="Discard examples where x.vel==0 AND theta.vel==0 during training")
     args = parser.parse_args()
 
     # ── Load dataset ──────────────────────────────────────────────────────────
@@ -79,11 +80,11 @@ def main():
 
     print(f"Loading dataset from {args.data} ...")
     data = np.load(args.data)
-    X = data["images"]   # (N, 84, 84, 3), uint8
-    y = data["labels"]   # (N, 3),          int64
+    X = data["images"]              # (N, 84, 84, 3), uint8
+    y = data["labels"][:, [0, 2]]  # (N, 2), int64 — x.vel and theta.vel only
 
     print(f"  images: {X.shape}  {X.dtype}")
-    print(f"  labels: {y.shape}  {y.dtype}")
+    print(f"  labels: {y.shape}  {y.dtype}  (x.vel, theta.vel)")
 
     # ── Train / test split ────────────────────────────────────────────────────
     X_train, X_test, y_train, y_test = train_test_split(
@@ -100,6 +101,7 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         val_split=args.val_split,
+        filter_stop=args.nostop,
         verbose=True,
     )
 
@@ -108,7 +110,6 @@ def main():
     metrics = policy.evaluate(X_test, y_test)
     print(f"  loss      : {metrics['loss']:.4f}")
     print(f"  acc x.vel : {metrics['acc_x']:.4f}")
-    print(f"  acc y.vel : {metrics['acc_y']:.4f}")
     print(f"  acc θ.vel : {metrics['acc_theta']:.4f}")
     print(f"  acc mean  : {metrics['acc_mean']:.4f}")
 
